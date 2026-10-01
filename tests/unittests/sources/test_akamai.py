@@ -1,8 +1,10 @@
+import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, Union
 
 import pytest
 
+from cloudinit import url_helper
 from cloudinit.sources.DataSourceAkamai import (
     DataSourceAkamai,
     DataSourceAkamaiLocal,
@@ -354,3 +356,67 @@ class TestDataSourceAkamai:
                 },
             ),
         ]
+
+    @pytest.mark.parametrize(
+        "ipv4_works,expected_warnings",
+        (
+            (True, []),
+            (
+                False,
+                [
+                    (
+                        "Failed to contact metadata service, falling back to "
+                        "local metadata only."
+                    )
+                ],
+            ),
+        ),
+    )
+    @mock.patch(
+        "cloudinit.sources.DataSourceAkamai.get_local_instance_id",
+        return_value="123",
+    )
+    @mock.patch(
+        "cloudinit.sources.DataSourceAkamai.is_on_akamai", return_value=True
+    )
+    @mock.patch("cloudinit.url_helper.readurl")
+    def test_get_data_network_fallback_logging(
+        self,
+        readurl,
+        _is_on_akamai,
+        _get_local_instance_id,
+        ipv4_works: bool,
+        expected_warnings: List[str],
+        caplog,
+    ):
+        """
+        Tests that a network that fails is logged without a warning while
+        another network may still work, and that only failing on every
+        network is a warning
+        """
+
+        def fake_readurl(url, **kwargs):
+            if "[fd00:" in url or not ipv4_works:
+                raise url_helper.UrlError(
+                    OSError("Network is unreachable"), url=url
+                )
+            if url.endswith("/v1/token"):
+                return mock.MagicMock(code=200, __str__=lambda _: "test-token")
+            if url.endswith("/v1/instance"):
+                return '{"id": 123}'
+            return ""
+
+        readurl.side_effect = fake_readurl
+
+        # init stage, so no ephemeral networking is set up
+        ds = self._get_datasource()
+        with caplog.at_level(logging.INFO):
+            assert ds._get_data()
+
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert warnings == expected_warnings
+        assert "Failed to retrieve metadata using IPv6" in caplog.text

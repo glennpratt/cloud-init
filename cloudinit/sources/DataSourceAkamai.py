@@ -282,8 +282,9 @@ class DataSourceAkamai(sources.DataSource):
         except url_helper.UrlError as e:
             # we failed to retrieve data with an exception; log the error and
             # return false, indicating that we should retry using a different
-            # network if possible
-            LOG.warning(
+            # network if possible. This is not a warning: another network may
+            # still succeed, and _get_data warns if none does.
+            LOG.info(
                 "Failed to retrieve metadata using IPv%s due to %s",
                 "6" if use_v6 else "4",
                 e,
