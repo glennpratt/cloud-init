@@ -356,12 +356,20 @@ class DataSourceAkamai(sources.DataSource):
         """
         try:
             # retrieve a token for future requests
+            # Right after boot the network may not pass traffic yet even with
+            # an address and a route. The metadata service is link-local and
+            # answers within a second, so in the local stage retry short
+            # requests rather than wait out long ones.
+            if self.local_stage:
+                timeout, sec_between, retries = 3, 1, 14
+            else:
+                timeout, sec_between, retries = 30, 2, 4
             token_response = url_helper.readurl(
                 self._build_url("token", use_v6=use_v6),
                 request_method="PUT",
-                timeout=30,
-                sec_between=2,
-                retries=4,
+                timeout=timeout,
+                sec_between=sec_between,
+                retries=retries,
                 headers={
                     "Metadata-Token-Expiry-Seconds": "300",
                 },
