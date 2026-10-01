@@ -293,10 +293,16 @@ class EphemeralDHCPv4:
         iface=None,
         connectivity_urls_data: Optional[List[Dict[str, Any]]] = None,
         dhcp_log_func: Optional[Callable[[str, str, str], None]] = None,
+        lease: Optional[Dict[str, Any]] = None,
     ):
+        """
+        @param lease: A lease already obtained by DHCP discovery, to set up
+            instead of performing discovery.
+        """
         self.iface = iface
         self._ephipv4: Optional[EphemeralIPv4Network] = None
         self.lease: Optional[Dict[str, Any]] = None
+        self._discovered_lease = lease
         self.dhcp_log_func = dhcp_log_func
         self.connectivity_urls_data = connectivity_urls_data or []
         self.distro = distro
@@ -338,9 +344,12 @@ class EphemeralDHCPv4:
         """
         if self.lease:
             return self.lease
-        self.lease = maybe_perform_dhcp_discovery(
-            self.distro, self.iface, self.dhcp_log_func
-        )
+        if self._discovered_lease:
+            self.lease = self._discovered_lease
+        else:
+            self.lease = maybe_perform_dhcp_discovery(
+                self.distro, self.iface, self.dhcp_log_func
+            )
         if not self.lease:
             raise NoDHCPLeaseError()
         LOG.debug(
