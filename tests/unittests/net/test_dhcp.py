@@ -262,6 +262,32 @@ class TestDHCPRFC3442(CiTestCase):
         }
         m_ipv4.assert_called_with(distro, **expected_kwargs)
 
+    @mock.patch("cloudinit.net.ephemeral.EphemeralIPv4Network")
+    @mock.patch("cloudinit.net.ephemeral.maybe_perform_dhcp_discovery")
+    def test_obtain_lease_sets_up_provided_lease(self, m_maybe, m_ipv4):
+        """EphemeralDHCPv4 sets up a lease it is given without discovery"""
+        lease = {
+            "interface": "eth0",
+            "fixed-address": "192.168.2.74",
+            "subnet-mask": "255.255.255.0",
+            "routers": "192.168.2.1",
+        }
+        distro = MockDistro()
+        eph = EphemeralDHCPv4(distro, "eth0", lease=lease)
+        assert eph.obtain_lease() == lease
+        m_maybe.assert_not_called()
+        m_ipv4.assert_called_with(
+            distro,
+            interface="eth0",
+            interface_addrs_before_dhcp=example_netdev,
+            ip="192.168.2.74",
+            prefix_or_mask="255.255.255.0",
+            broadcast="192.168.2.255",
+            static_routes=None,
+            router="192.168.2.1",
+        )
+        m_ipv4.return_value.__enter__.assert_called_once()
+
 
 class TestDHCPParseStaticRoutes(CiTestCase):
     with_logs = True
