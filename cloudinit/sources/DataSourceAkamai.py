@@ -1,14 +1,27 @@
 import binascii
 import json
 import logging
+import socket
+import threading
+import time
 from base64 import b64decode
 from contextlib import suppress as noop
 from enum import Enum
-from typing import Any, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 from cloudinit import sources, url_helper, util
 from cloudinit.net import find_fallback_nic, get_interfaces_by_mac
-from cloudinit.net.ephemeral import EphemeralIPNetwork
+from cloudinit.net.dhcp import (
+    Dhcpcd,
+    NoDHCPLeaseError,
+    maybe_perform_dhcp_discovery,
+)
+from cloudinit.net.ephemeral import (
+    EphemeralDHCPv4,
+    EphemeralIPNetwork,
+    EphemeralIPv6Network,
+)
 from cloudinit.sources.helpers.akamai import (
     get_dmi_config,
     get_local_instance_id,
@@ -40,6 +53,13 @@ BUILTIN_DS_CONFIG = {
         "f2:3",
     ],
 }
+
+
+# How long the local stage waits for a route to the IPv6 metadata service.
+# The route comes from a router advertisement; until one arrives every request
+# fails with "Network is unreachable".
+IPV6_ROUTE_TIMEOUT = 20.0
+IPV6_ROUTE_POLL_INTERVAL = 0.1
 
 
 class MetadataAvailabilityResult(Enum):
@@ -145,6 +165,127 @@ class DataSourceAkamai(sources.DataSource):
 
         return MetadataAvailabilityResult.AVAILABLE
 
+    def _get_local_interface(self):
+        """
+        Returns the interface to reach the metadata service through in the
+        local stage: the first with a preferred MAC address prefix, or else
+        the fallback interface.
+        """
+        # find the first interface that isn't lo or a vlan interface
+        interfaces = get_interfaces_by_mac()
+        preferred_prefixes = self.ds_cfg["preferred_mac_prefixes"]
+        for mac, inf in interfaces.items():
+            # try to match on the preferred mac prefixes
+            if any([mac.startswith(prefix) for prefix in preferred_prefixes]):
+                return inf
+
+        LOG.warning(
+            "Failed to find default interface, attempting DHCP on "
+            "fallback interface"
+        )
+        return find_fallback_nic()
+
+    def _wait_for_ipv6_route(
+        self, deadline: float, stop: Optional[threading.Event] = None
+    ) -> bool:
+        """
+        Waits until the deadline (a time.monotonic() value) for a route to
+        the IPv6 metadata service, or until stop is set, and returns whether
+        there is one. Connecting a UDP socket looks up the route without
+        sending anything.
+        """
+        host = urlparse(self.ds_cfg["base_urls"]["ipv6"]).hostname
+        stop = stop or threading.Event()
+        while True:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+                try:
+                    sock.connect((host, 80))
+                    return True
+                except OSError as e:
+                    error = e
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                LOG.info("No route to the IPv6 metadata service: %s", error)
+                return False
+            if stop.wait(min(IPV6_ROUTE_POLL_INTERVAL, remaining)):
+                return False
+
+    def _can_race_local_networks(self) -> bool:
+        """
+        Returns whether the local stage can try IPv6 and IPv4 at once: both
+        are allowed, and DHCP discovery leaves the interface unconfigured
+        until we set up the lease ourselves.
+        """
+        if not (
+            self.ds_cfg["allow_ipv6"]
+            and self.ds_cfg["allow_ipv4"]
+            and self.ds_cfg["allow_dhcp"]
+        ):
+            return False
+        try:
+            dhcp_client = self.distro.dhcp_client
+        except NoDHCPLeaseError:
+            return False
+        # dhcpcd configures the address it obtains itself, so stopping it
+        # early would leave it behind; set up one network at a time instead.
+        return not isinstance(dhcp_client, Dhcpcd)
+
+    def _race_local_networks(self) -> List[Tuple[Any, bool]]:
+        """
+        Sets up the local stage's network by racing IPv6 against IPv4: waits
+        for a route to the IPv6 metadata service while DHCPv4 discovery runs
+        in the background. Neither changes the interface's addresses, so the
+        one that loses is stopped with nothing to undo. Returns network
+        context managers to try in order, the winner first.
+        """
+        interface = self._get_local_interface()
+        result: Dict[str, Any] = {}
+        discovered = threading.Event()
+
+        def discover():
+            try:
+                result["lease"] = maybe_perform_dhcp_discovery(
+                    self.distro, interface
+                )
+            except NoDHCPLeaseError as e:
+                LOG.info("DHCPv4 discovery on %s failed: %s", interface, e)
+            finally:
+                discovered.set()
+
+        start = time.monotonic()
+        deadline = start + IPV6_ROUTE_TIMEOUT
+        # bringing the link up makes the kernel solicit a router
+        # advertisement
+        with EphemeralIPv6Network(self.distro, interface):
+            worker = threading.Thread(target=discover, daemon=True)
+            worker.start()
+            route = self._wait_for_ipv6_route(deadline, stop=discovered)
+            if not route and "lease" not in result:
+                # DHCPv4 failed; IPv6 may still come
+                route = self._wait_for_ipv6_route(deadline)
+            if not discovered.is_set():
+                self.distro.dhcp_client.kill_dhcp_client()
+            worker.join()
+
+        elapsed = time.monotonic() - start
+        if route:
+            LOG.info("Using IPv6 for metadata (route after %.1fs)", elapsed)
+            return [
+                (noop(), True),
+                (EphemeralIPNetwork(self.distro, interface, ipv4=True), False),
+            ]
+        if "lease" in result:
+            LOG.info("Using IPv4 for metadata (lease after %.1fs)", elapsed)
+            return [
+                (
+                    EphemeralDHCPv4(
+                        self.distro, interface, lease=result["lease"]
+                    ),
+                    False,
+                )
+            ]
+        return []
+
     def _get_network_context_managers(
         self,
     ) -> List[Tuple[Union[Any, EphemeralIPNetwork], bool]]:
@@ -160,24 +301,7 @@ class DataSourceAkamai(sources.DataSource):
             # at this stage, networking isn't up yet.  To support that, we need
             # an ephemeral network
 
-            # find the first interface that isn't lo or a vlan interface
-            interfaces = get_interfaces_by_mac()
-            interface = None
-            preferred_prefixes = self.ds_cfg["preferred_mac_prefixes"]
-            for mac, inf in interfaces.items():
-                # try to match on the preferred mac prefixes
-                if any(
-                    [mac.startswith(prefix) for prefix in preferred_prefixes]
-                ):
-                    interface = inf
-                    break
-
-            if interface is None:
-                LOG.warning(
-                    "Failed to find default interface, attempting DHCP on "
-                    "fallback interface"
-                )
-                interface = find_fallback_nic()
+            interface = self._get_local_interface()
 
             network_context_managers = []
 
@@ -322,9 +446,23 @@ class DataSourceAkamai(sources.DataSource):
             )
             return False
 
-        network_context_managers = self._get_network_context_managers()
+        if self.local_stage and self._can_race_local_networks():
+            network_context_managers = self._race_local_networks()
+        else:
+            network_context_managers = self._get_network_context_managers()
         for manager, use_v6 in network_context_managers:
             with manager:
+                # In the local stage IPv6 needs a router advertisement before
+                # it can reach the metadata service; don't spend the request
+                # retries waiting for one.
+                if (
+                    use_v6
+                    and self.local_stage
+                    and not self._wait_for_ipv6_route(
+                        time.monotonic() + IPV6_ROUTE_TIMEOUT
+                    )
+                ):
+                    continue
                 done = self._fetch_metadata(use_v6=use_v6)
                 if done:
                     # fix up some field names
