@@ -599,3 +599,32 @@ class TestDataSourceAkamai:
         else:
             readurl.assert_not_called()
             assert ds.metadata["instance-id"] == "123"
+
+    @pytest.mark.parametrize(
+        "local,expected_retries",
+        (
+            (True, {"timeout": 3, "sec_between": 1, "retries": 14}),
+            (False, {"timeout": 30, "sec_between": 2, "retries": 4}),
+        ),
+    )
+    @mock.patch("cloudinit.url_helper.readurl")
+    def test_fetch_metadata_token_retries(
+        self, readurl, local: bool, expected_retries: Dict[str, int]
+    ):
+        """
+        Tests that the local stage requests a token with short, frequent
+        attempts, since the network may not pass traffic yet
+        """
+        readurl.side_effect = [
+            mock.MagicMock(code=200, __str__=lambda _: "test-token"),
+            '{"id": 123}',
+            "",
+        ]
+        ds = self._get_datasource(local=local)
+        assert ds._fetch_metadata()
+        assert readurl.mock_calls[0] == mock.call(
+            "http://169.254.169.254/v1/token",
+            request_method="PUT",
+            headers={"Metadata-Token-Expiry-Seconds": "300"},
+            **expected_retries,
+        )
