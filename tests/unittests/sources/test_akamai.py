@@ -1,10 +1,18 @@
 import logging
+import threading
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, Union
 
 import pytest
 
 from cloudinit import url_helper
+from cloudinit.net.dhcp import (
+    Dhcpcd,
+    IscDhclient,
+    NoDHCPLeaseError,
+    NoDHCPLeaseMissingDhclientError,
+    Udhcpc,
+)
 from cloudinit.sources.DataSourceAkamai import (
     DataSourceAkamai,
     DataSourceAkamaiLocal,
@@ -420,3 +428,174 @@ class TestDataSourceAkamai:
         ]
         assert warnings == expected_warnings
         assert "Failed to retrieve metadata using IPv6" in caplog.text
+
+    @pytest.mark.parametrize(
+        "ds_cfg,dhcp_client,expected",
+        (
+            ({}, Udhcpc, True),
+            ({}, IscDhclient, True),
+            # dhcpcd configures the address it obtains
+            ({}, Dhcpcd, False),
+            ({}, NoDHCPLeaseMissingDhclientError(), False),
+            ({"allow_ipv6": False}, Udhcpc, False),
+            ({"allow_ipv4": False}, Udhcpc, False),
+            ({"allow_dhcp": False}, Udhcpc, False),
+        ),
+    )
+    def test_can_race_local_networks(
+        self, ds_cfg: Dict[str, Any], dhcp_client, expected: bool
+    ):
+        """
+        Tests that the local stage only races IPv6 against DHCPv4 when both
+        are allowed and DHCP discovery leaves the interface unconfigured
+        """
+        ds = self._get_datasource(ds_cfg=ds_cfg, local=True)
+        ds.distro = mock.MagicMock()
+        if isinstance(dhcp_client, Exception):
+            type(ds.distro).dhcp_client = mock.PropertyMock(
+                side_effect=dhcp_client
+            )
+        else:
+            ds.distro.dhcp_client = mock.create_autospec(
+                dhcp_client, instance=True
+            )
+        assert ds._can_race_local_networks() is expected
+
+    @pytest.mark.parametrize(
+        "route_after,dhcp,expected_networks,expect_kill",
+        (
+            # the route arrives while DHCPv4 discovery is still waiting
+            (0.05, "slow", [("noop", True), ("dhcp", False)], True),
+            # DHCPv4 gets a lease while there is still no route
+            (None, "lease", [("lease", False)], False),
+            # DHCPv4 fails; the route arrives afterwards
+            (0.05, "fail", [("noop", True), ("dhcp", False)], False),
+            # neither
+            (None, "fail", [], False),
+        ),
+    )
+    @mock.patch("cloudinit.sources.DataSourceAkamai.IPV6_ROUTE_TIMEOUT", 0.5)
+    @mock.patch("cloudinit.sources.DataSourceAkamai.EphemeralIPv6Network")
+    @mock.patch("cloudinit.sources.DataSourceAkamai.EphemeralIPNetwork")
+    @mock.patch("cloudinit.sources.DataSourceAkamai.EphemeralDHCPv4")
+    @mock.patch("cloudinit.sources.DataSourceAkamai.socket.socket")
+    @mock.patch(
+        "cloudinit.sources.DataSourceAkamai.maybe_perform_dhcp_discovery"
+    )
+    @mock.patch("cloudinit.sources.DataSourceAkamai.get_interfaces_by_mac")
+    def test_race_local_networks(
+        self,
+        get_interfaces_by_mac,
+        dhcp_discovery,
+        socket_cls,
+        ephemeral_dhcpv4,
+        ephemeral_ip_network,
+        ephemeral_ipv6,
+        route_after: Optional[float],
+        dhcp: str,
+        expected_networks: List,
+        expect_kill: bool,
+    ):
+        """
+        Tests that the local stage uses whichever of IPv6 and DHCPv4 is ready
+        first, and stops a DHCPv4 discovery that loses
+        """
+        get_interfaces_by_mac.return_value = {"f2:3a:bc:de:f0:12": "eth0"}
+        lease = {"interface": "eth0", "fixed-address": "192.0.2.10"}
+        killed = threading.Event()
+
+        def discover(distro, interface):
+            assert interface == "eth0"
+            if dhcp == "lease":
+                return lease
+            if dhcp == "slow":
+                # blocks until the client is killed
+                assert killed.wait(5)
+            raise NoDHCPLeaseError()
+
+        dhcp_discovery.side_effect = discover
+
+        route_ready = threading.Event()
+        if route_after is not None:
+            threading.Timer(route_after, route_ready.set).start()
+
+        def connect(address):
+            assert address == ("fd00:a9fe:a9fe::1", 80)
+            if not route_ready.is_set():
+                raise OSError(101, "Network is unreachable")
+
+        socket_cls.return_value.__enter__.return_value.connect.side_effect = (
+            connect
+        )
+
+        ds = self._get_datasource(local=True)
+        ds.distro = mock.MagicMock()
+        ds.distro.dhcp_client.kill_dhcp_client.side_effect = killed.set
+
+        networks = ds._race_local_networks()
+
+        names = {
+            id(ephemeral_ip_network.return_value): "dhcp",
+            id(ephemeral_dhcpv4.return_value): "lease",
+        }
+        assert [
+            (
+                "noop" if isinstance(m, suppress) else names[id(m)],
+                use_v6,
+            )
+            for m, use_v6 in networks
+        ] == expected_networks
+        assert ds.distro.dhcp_client.kill_dhcp_client.called is expect_kill
+        ephemeral_ipv6.assert_called_once_with(ds.distro, "eth0")
+        if dhcp == "lease":
+            ephemeral_dhcpv4.assert_called_once_with(
+                ds.distro, "eth0", lease=lease
+            )
+
+    @pytest.mark.parametrize("ipv6_route", (True, False))
+    @mock.patch(
+        "cloudinit.sources.DataSourceAkamai.get_local_instance_id",
+        return_value="123",
+    )
+    @mock.patch(
+        "cloudinit.sources.DataSourceAkamai.is_on_akamai", return_value=True
+    )
+    @mock.patch("cloudinit.sources.DataSourceAkamai.EphemeralIPNetwork")
+    @mock.patch("cloudinit.sources.DataSourceAkamai.get_interfaces_by_mac")
+    @mock.patch("cloudinit.url_helper.readurl")
+    def test_get_data_local_ipv6_only_waits_for_route(
+        self,
+        readurl,
+        get_interfaces_by_mac,
+        _ephemeral,
+        _is_on_akamai,
+        _get_local_instance_id,
+        ipv6_route: bool,
+    ):
+        """
+        Tests that without IPv4 the local stage only requests metadata over
+        IPv6 once there is a route to it
+        """
+        get_interfaces_by_mac.return_value = {"f2:3a:bc:de:f0:12": "eth0"}
+
+        def fake_readurl(url, **kwargs):
+            if url.endswith("/v1/token"):
+                return mock.MagicMock(code=200, __str__=lambda _: "test-token")
+            if url.endswith("/v1/instance"):
+                return '{"id": 123}'
+            return ""
+
+        readurl.side_effect = fake_readurl
+
+        ds = self._get_datasource(ds_cfg={"allow_ipv4": False}, local=True)
+        with mock.patch.object(
+            ds, "_wait_for_ipv6_route", return_value=ipv6_route
+        ):
+            assert ds._get_data()
+
+        if ipv6_route:
+            assert readurl.call_count == 3
+            assert ds.metadata["instance-id"] == 123
+        else:
+            readurl.assert_not_called()
+            assert ds.metadata["instance-id"] == "123"
