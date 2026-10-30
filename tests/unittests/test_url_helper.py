@@ -1,8 +1,11 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 # pylint: disable=attribute-defined-outside-init
 
+import json
 import logging
+import os
 import pathlib
+import time
 from functools import partial
 from threading import Event
 from time import process_time
@@ -36,6 +39,20 @@ except ImportError:
 
 
 M_PATH = "cloudinit.url_helper."
+
+
+@pytest.fixture(params=("UTC0", "UTC-5", "UTC8"))
+def host_tz(request):
+    """Run the test with the host at, east and west of UTC."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = request.param
+    time.tzset()
+    yield request.param
+    if old is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = old
+    time.tzset()
 
 
 def exception_cb(exception):
@@ -89,8 +106,13 @@ class TestOauthUrlHelper:
         assert oauth_helper.readurl(url).contents == data
 
     @responses.activate
-    def test_default_exception_cb(self, tmp_path, caplog):
-        """Test that the default exception_cb is used."""
+    def test_default_exception_cb(self, tmp_path, caplog, mocker, host_tz):
+        """Test that the default exception_cb is used.
+
+        The Date header is GMT, so the skew is the same in any timezone.
+        """
+        # 30 seconds before 2015-10-21T07:28:00Z, the response's Date
+        mocker.patch("time.time", return_value=1445412480 - 30)
         skew_file = tmp_path / "skew.json"
         oauth_helper = url_helper.OauthUrlHelper(skew_data_file=skew_file)
         url = "http://myhost/path"
@@ -107,7 +129,7 @@ class TestOauthUrlHelper:
         with pytest.raises(UrlError) as e:
             oauth_helper.readurl(url)
         assert e.value.code == 401
-        assert "myhost" in skew_file.read_text()
+        assert json.loads(skew_file.read_text()) == {"myhost": 30}
 
     @responses.activate
     def test_custom_exception_cb(self):
@@ -1026,28 +1048,68 @@ class TestHandleError:
         assert _handle_error(UrlError("test", code=503)) == 1
         assert "Unable to introspect response header" in caplog.text
 
-    def test_handle_503_with_retry_header(self):
-        """Test 503 with a retry integer value."""
-        assert (
-            _handle_error(
-                UrlError("test", code=503, headers={"Retry-After": 5})
-            )
-            == 5
-        )
+    @pytest.mark.parametrize(
+        "retry_after, expected",
+        (
+            pytest.param(5, 5, id="seconds"),
+            # 10 seconds after 2000-01-01T00:00:00Z
+            pytest.param("Sat, 01 Jan 2000 00:00:10 GMT", 10, id="date"),
+            # The same instant with a numeric offset
+            pytest.param(
+                "Sat, 01 Jan 2000 01:00:10 +0100", 10, id="date-offset"
+            ),
+        ),
+    )
+    def test_handle_503_with_retry_header(
+        self, retry_after, expected, mocker, host_tz
+    ):
+        """Test 503 with a retry value in seconds or as an HTTP-date.
 
-    def test_handle_503_with_retry_header_in_past(self, caplog):
-        """Test 503 with date in the past."""
+        An HTTP-date is GMT, so the wait is the same in any timezone.
+        """
+        mocker.patch("time.time", return_value=946684800.0)
         assert (
             _handle_error(
                 UrlError(
-                    "test",
-                    code=503,
-                    headers={"Retry-After": "Fri, 31 Dec 1999 23:59:59 GMT"},
+                    "test", code=503, headers={"Retry-After": retry_after}
+                )
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        "retry_after, message",
+        (
+            pytest.param(
+                "Fri, 31 Dec 1999 23:59:59 GMT",
+                "Retry-After header value is in the past",
+                id="past",
+            ),
+            pytest.param(
+                "soon",
+                "Failed to parse Retry-After header value",
+                id="unparseable",
+            ),
+            pytest.param(
+                "Fri, 31 Dec 99999999999 23:59:59 GMT",
+                "Failed to parse Retry-After header value",
+                id="unrepresentable",
+            ),
+        ),
+    )
+    def test_handle_503_with_retry_header_waits_one_second(
+        self, retry_after, message, caplog
+    ):
+        """Test 503 with a Retry-After that can't be waited for."""
+        assert (
+            _handle_error(
+                UrlError(
+                    "test", code=503, headers={"Retry-After": retry_after}
                 )
             )
             == 1
         )
-        assert "Retry-After header value is in the past" in caplog.text
+        assert message in caplog.text
 
     def test_handle_503_cb_true(self):
         """Test 503 with a callback returning True."""

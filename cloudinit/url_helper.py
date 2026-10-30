@@ -17,7 +17,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
-from email.utils import parsedate
+from email.utils import mktime_tz, parsedate_tz
 from functools import partial
 from http.client import NOT_FOUND
 from itertools import count
@@ -391,13 +391,13 @@ def _get_retry_after(retry_after: str) -> float:
         # Translate a date such as "Fri, 31 Dec 1999 23:59:59 GMT"
         # into seconds to wait
         try:
-            time_tuple = parsedate(retry_after)
+            time_tuple = parsedate_tz(retry_after)
             if not time_tuple:
                 raise ValueError(
                     "Failed to parse Retry-After header value"
                 ) from exc
-            to_wait = float(time.mktime(time_tuple) - time.time())
-        except ValueError:
+            to_wait = float(mktime_tz(time_tuple) - time.time())
+        except (ValueError, OverflowError):
             LOG.info(
                 "Failed to parse Retry-After header value: %s. "
                 "Waiting 1 second instead.",
@@ -1051,7 +1051,7 @@ class OauthUrlHelper:
 
         date = exception.headers["date"]
         try:
-            remote_time = time.mktime(parsedate(date))
+            remote_time = mktime_tz(parsedate_tz(date))
         except Exception as e:
             LOG.warning("Failed to convert datetime '%s': %s", date, e)
             return
